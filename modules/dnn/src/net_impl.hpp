@@ -135,6 +135,9 @@ struct Net::Impl : public detail::NetImplBase
     std::vector<int> bufidxs;
     std::vector<Mat> buffers;
     std::vector<Mat> scratchBufs;
+    // interior tensors kept alive for forward-to-layer
+    // See https://github.com/opencv/opencv/issues/26349
+    std::vector<Arg> pinnedArgs;
     std::vector<Ptr<Graph> > allgraphs;
     KVCacheManager kvCacheManager;
 
@@ -500,6 +503,9 @@ struct Net::Impl : public detail::NetImplBase
     // run the whole model, convenience wrapper
     void forwardWithMultipleOutputs(OutputArrayOfArrays outputBlobs,
                                     const std::vector<std::string>& outBlobNames);
+    // forward-to-layer: each name yields all outputs of the producing op
+    void forwardWithMultipleOutputsPerLayer(std::vector<std::vector<Mat> >& outputBlobs,
+                                            const std::vector<std::string>& outBlobNames);
     // try infer shapes; if some layers produce tensors with dynamic shapes, shape inference is impossible
     bool tryInferShapes(const std::vector<MatShape>& suggestedInpShapes,
                         const std::vector<MatType>& suggestedInpTypes,
@@ -536,8 +542,8 @@ struct Net::Impl : public detail::NetImplBase
     void inferShapes(bool symbolic);
     // sets certain buffer index for each intermediate argument (Arg)
     void assignBuffers();
-    // fuse batch norm, add bias and activation to convolution
-    void fuseBasic();
+    // collapse Reshape+InstanceNorm+Reshape+Mul+Add into InstanceNorm or GroupNormalization
+    void fuseInstanceNormAffine();
     void fuseChains();
     // fuse ViT-style multi-head attention subgraphs
     void fuseAttention();
