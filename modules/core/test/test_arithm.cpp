@@ -2,6 +2,8 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 #include "test_precomp.hpp"
+#include <iomanip>
+#include <limits>
 #include "ref_reduce_arg.impl.hpp"
 #include <algorithm>
 
@@ -3062,6 +3064,122 @@ INSTANTIATE_TEST_CASE_P(/**/, Core_SumWide,
         testing::Values(1, 2, 3, 4),
         testing::Values(4, 127)));
 
+// Floating-point sources with values far outside of the destination integer range must saturate,
+// in the vector body as well as in the scalar tail (see cvRound(), saturate_cast<>).
+template<typename ST, typename DT> static void checkConvertToOverflow(int sdepth, int ddepth)
+{
+    const double inf = std::numeric_limits<double>::infinity();
+    const double vals[] =
+    {
+        1e10, -1e10, 3e9, -3e9, 2147483647.5, -2147483648.5, inf, -inf, 65535.4, 65535.6, -1.5, 40000,
+        200.5, 201.5, -200.5, 0, 1e30, -1e30, 2.5, 3.5, 4294967295., 1e19, 9223372036854775808., -9223372036854775808.
+    };
+    const int nvals = (int)(sizeof(vals)/sizeof(vals[0]));
+    const int rows = 3, cols = 67;   // 67: not a multiple of any vector width => both the body and the tail are used
+    Mat src(rows, cols, sdepth), ref(rows, cols, ddepth);
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+        {
+            ST v = (ST)vals[(r*cols + c) % nvals];
+            src.at<ST>(r, c) = v;
+            ref.at<DT>(r, c) = saturate_cast<DT>(v);
+        }
+    Mat dst;
+    src.convertTo(dst, ddepth);
+    ASSERT_EQ(ddepth, dst.depth());
+    int nerrs = 0;
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+        {
+            double v = vals[(r*cols + c) % nvals];
+            DT d = dst.at<DT>(r, c), rf = ref.at<DT>(r, c);
+            bool ok = d == rf;
+            // the extreme inputs (+-1e30, +-inf) must land on the type limits; for int <- float the
+            // positive limit is platform-dependent (INT_MAX or 2147483520, see the cvRound() documentation)
+            if (v >= 1e29)
+            {
+                if (sizeof(DT) == 4 && std::numeric_limits<DT>::is_signed && sizeof(ST) == 4)
+                    ok = ok && (double)d >= 2147483520.;
+                else
+                    ok = ok && d == std::numeric_limits<DT>::max();
+            }
+            else if (v <= -1e29)
+                ok = ok && d == std::numeric_limits<DT>::lowest();
+            if (!ok && nerrs++ < 10)
+                ADD_FAILURE() << "sdepth=" << sdepth << " ddepth=" << ddepth << " (" << r << "," << c << "): src=" << std::setprecision(17) << v
+                              << " -> " << (double)d << ", expected " << (double)rf;
+        }
+    EXPECT_EQ(0, nerrs);
+}
+
+TEST(Core_ConvertTo, float_overflow_saturation)
+{
+    checkConvertToOverflow<float, uchar>(CV_32F, CV_8U);
+    checkConvertToOverflow<float, schar>(CV_32F, CV_8S);
+    checkConvertToOverflow<float, ushort>(CV_32F, CV_16U);
+    checkConvertToOverflow<float, short>(CV_32F, CV_16S);
+    checkConvertToOverflow<float, int>(CV_32F, CV_32S);
+    checkConvertToOverflow<float, unsigned>(CV_32F, CV_32U);
+    checkConvertToOverflow<float, int64>(CV_32F, CV_64S);
+    checkConvertToOverflow<float, uint64>(CV_32F, CV_64U);
+    checkConvertToOverflow<double, uchar>(CV_64F, CV_8U);
+    checkConvertToOverflow<double, schar>(CV_64F, CV_8S);
+    checkConvertToOverflow<double, ushort>(CV_64F, CV_16U);
+    checkConvertToOverflow<double, short>(CV_64F, CV_16S);
+    checkConvertToOverflow<double, int>(CV_64F, CV_32S);
+    checkConvertToOverflow<double, unsigned>(CV_64F, CV_32U);
+    checkConvertToOverflow<double, int64>(CV_64F, CV_64S);
+    checkConvertToOverflow<double, uint64>(CV_64F, CV_64U);
+}
+
+// Narrowing a 64-bit or 32-bit-unsigned array must SATURATE, and identically at every dispatch
+// level. The vectorized path narrows through a 32-bit intermediate, and v_pack() truncates at
+// 64->32 (unlike the narrower widths, which saturate), so an unclamped value used to wrap before
+// the final saturating step ever saw it - turning 4294967295 into 0 rather than 255. Only the
+// vector loop was affected, so the single element result is the reference. 127 elements covers
+// both the vector body and an odd tail.
+typedef testing::TestWithParam< tuple<int, int, double> > Core_ConvertToSaturate;
+
+TEST_P(Core_ConvertToSaturate, length_independent)
+{
+    const int srcDepth = get<0>(GetParam());
+    const int dstDepth = get<1>(GetParam());
+    const double value = get<2>(GetParam());
+    const int N = 127;
+
+    Mat one64(1, 1, CV_64F, Scalar(value));
+    Mat one; one64.convertTo(one, srcDepth);
+    Mat oneDst; one.convertTo(oneDst, dstDepth);
+    Mat ref; oneDst.convertTo(ref, CV_64F);
+    const double expected = ref.at<double>(0, 0);
+
+    Mat src64(1, N, CV_64F, Scalar(value));
+    Mat src; src64.convertTo(src, srcDepth);
+    Mat dst; src.convertTo(dst, dstDepth);
+    Mat got; dst.convertTo(got, CV_64F);
+
+    for (int i = 0; i < N; i++)
+        ASSERT_EQ(expected, got.at<double>(0, i)) << "index " << i;
+}
+
+INSTANTIATE_TEST_CASE_P(From32U, Core_ConvertToSaturate,
+    testing::Combine(
+        testing::Values(CV_32U),
+        testing::Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S),
+        testing::Values(4294967295.0, 2147483648.0, 70000.0, 65536.0, 300.0)));
+
+// The 64-bit sources additionally carry values at opposite ends of the 64-bit range: a clamp built
+// on the 64-bit ordering compares gets those wrong at the SSE and NEON baselines, where v_gt is
+// the sign of a subtraction that overflows. They are not crossed with the CV_32U source, where
+// they would only exercise the double -> CV_32U conversion rather than the narrowing under test.
+INSTANTIATE_TEST_CASE_P(From64, Core_ConvertToSaturate,
+    testing::Combine(
+        testing::Values(CV_64U, CV_64S),
+        testing::Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S),
+        testing::Values(4294967295.0, 2147483648.0, 65536.0, 300.0,
+                        -9223372036854775808.0, 9223372036854775807.0,
+                        -2147483649.0, -2147483648.0, -1.0)));
+
 TEST(Core_ConvertTo, regression_12121)
 {
     {
@@ -4308,8 +4426,8 @@ TEST_P(Core_MaskTypeTest, MeanStdDev)
 
 INSTANTIATE_TEST_CASE_P(/**/, Core_MaskTypeTest, MaskType::all());
 
-// Still fails in 5.x: https://github.com/opencv/opencv/issues/28557
-TEST(Core_Arithm, DISABLED_mul_overflow_28557)
+// https://github.com/opencv/opencv/issues/28557
+TEST(Core_Arithm, mul_overflow_28557)
 {
     uint16_t data[] = {5000, 60000, 5000, 60000, 5000, 60000};
     cv::Mat m(1, 6, CV_16U, data);
@@ -4319,6 +4437,53 @@ TEST(Core_Arithm, DISABLED_mul_overflow_28557)
     {
         EXPECT_EQ(65535, res.at<uint16_t>(0, i));
     }
+}
+
+// multiply / pow(x, 2) on 8- and 16-bit integer arrays whose products overflow the element type
+// (and, for 16U, int): every row length from 1 to 70, so that both the vector body and the scalar
+// tail are exercised, out-of-place and in-place. The scalar tail computes the product in float and
+// narrows it with saturate_cast<> -> cvRound(), which must saturate (#28557).
+template<typename T> static void checkMulOverflow(int depth, const std::vector<T>& vals)
+{
+    const int nvals = (int)vals.size();
+    for (int n = 1; n <= 70; n++)
+    {
+        Mat a(1, n, depth), b(1, n, depth), ref_ab(1, n, depth), ref_aa(1, n, depth);
+        for (int i = 0; i < n; i++)
+        {
+            T x = vals[i % nvals], y = vals[(i * 7 + 3) % nvals];
+            a.at<T>(0, i) = x;
+            b.at<T>(0, i) = y;
+            ref_ab.at<T>(0, i) = saturate_cast<T>((int64)x * (int64)y);
+            ref_aa.at<T>(0, i) = saturate_cast<T>((int64)x * (int64)x);
+        }
+        Mat c;
+        cv::multiply(a, b, c);
+        EXPECT_EQ(0, cvtest::norm(c, ref_ab, NORM_INF)) << "multiply(a, b, c), depth=" << depth << ", n=" << n;
+        c = a.mul(b);
+        EXPECT_EQ(0, cvtest::norm(c, ref_ab, NORM_INF)) << "a.mul(b), depth=" << depth << ", n=" << n;
+        cv::pow(a, 2, c);
+        EXPECT_EQ(0, cvtest::norm(c, ref_aa, NORM_INF)) << "pow(a, 2, c), depth=" << depth << ", n=" << n;
+
+        Mat d = a.clone();
+        cv::multiply(d, b, d);
+        EXPECT_EQ(0, cvtest::norm(d, ref_ab, NORM_INF)) << "multiply(a, b, a), depth=" << depth << ", n=" << n;
+        d = a.clone();
+        cv::multiply(b, d, d);
+        EXPECT_EQ(0, cvtest::norm(d, ref_ab, NORM_INF)) << "multiply(b, a, a), depth=" << depth << ", n=" << n;
+        d = a.clone();
+        cv::pow(d, 2, d);
+        EXPECT_EQ(0, cvtest::norm(d, ref_aa, NORM_INF)) << "pow(a, 2, a), depth=" << depth << ", n=" << n;
+    }
+}
+
+TEST(Core_Arithm, mul_overflow_tail_and_inplace)
+{
+    checkMulOverflow<uchar>(CV_8U, {0, 1, 2, 15, 16, 17, 100, 128, 200, 254, 255});
+    checkMulOverflow<schar>(CV_8S, {-128, -127, -100, -12, -11, -1, 0, 1, 11, 12, 100, 127});
+    // 46341^2 and 65535^2 exceed INT_MAX, 46340^2 does not
+    checkMulOverflow<ushort>(CV_16U, {0, 1, 2, 255, 256, 257, 300, 46340, 46341, 50000, 65534, 65535});
+    checkMulOverflow<short>(CV_16S, {-32768, -32767, -256, -182, -181, -1, 0, 1, 181, 182, 256, 32767});
 }
 
 
@@ -4370,6 +4535,20 @@ TEST(Core_Arithm, addWeighted_fp64_uses_fp32_intermediate_29880)
     const double fp64Only = (double)srcVal*(double)alpha + (double)srcVal*(double)beta + (double)gamma;
     ASSERT_NE(fp32Then64, fp64Only) << "chosen alpha does not distinguish the two code paths";
     EXPECT_EQ(fp32Then64, dst.at<double>(0, 0));
+}
+
+// https://github.com/opencv/opencv/issues/30153
+TEST(Core_Arithm, inRange_unsupported_depth_30153)
+{
+    for (int depth : {CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ})
+    {
+        for (int cn : {1, 3})
+        {
+            cv::Mat src(4, 4, CV_MAKETYPE(depth, cn), cv::Scalar::all(0)), dst;
+            EXPECT_THROW(cv::inRange(src, cv::Scalar::all(0), cv::Scalar::all(1), dst), cv::Exception);
+            EXPECT_THROW(cv::inRange(src, src, src, dst), cv::Exception);
+        }
+    }
 }
 
 

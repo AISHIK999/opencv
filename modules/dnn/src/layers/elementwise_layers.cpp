@@ -205,6 +205,21 @@ template<typename Op> static inline bool intUnaryDispatch(const Mat& src, Mat& d
     return true;
 }
 
+static int computeElementwiseNstripes(const Mat& src)
+{
+    // Must match PBody::operator()'s own planeSize: it splits the per-sample plane, i.e. the
+    // dimensions from 2 on, and nothing else. A rank-1 tensor has no such dimensions -- PBody
+    // reads it as a single plane of size 1 whose elements are all channels, and the channel
+    // loop is not striped -- so its plane size is 1 here too, however many elements it holds.
+    // Deriving it from size[0] instead would ask for stripes PBody cannot hand out any work.
+    size_t planeSize = 1;
+    for (int d = 2; d < src.dims; ++d)
+        planeSize *= (size_t)src.size[d];
+
+    int nstripes = (int)std::max(1.0, (double)src.total() * (1. / 1024));
+    return (int)std::min((size_t)nstripes, planeSize);
+}
+
 template<typename Func>
 class ElementWiseLayer : public Func::Layer
 {
@@ -242,8 +257,8 @@ public:
                 planeSize *= src_->size[i];
 
             size_t stripeSize = (planeSize + nstripes - 1)/nstripes;
-            size_t stripeStart = r.start*stripeSize;
-            size_t stripeEnd = std::min(r.end*stripeSize, planeSize);
+            size_t stripeStart = std::min((size_t)r.start*stripeSize, planeSize);
+            size_t stripeEnd = std::min((size_t)r.end*stripeSize, planeSize);
 
             for( int i = 0; i < nsamples; i++ )
             {
@@ -371,6 +386,10 @@ public:
             if (ElementWiseIntDispatch<Func>::apply(func, src, dst))
                 continue;
 
+            if ((src.depth() == CV_32F || src.depth() == CV_64F) && src.type() == dst.type() &&
+                func.applyCore(src, dst))
+                continue;
+
             if (src.type() == CV_32F && dst.type() == CV_32F)
             {
                 // Try fast activation function path first
@@ -388,7 +407,7 @@ public:
                     continue;
                 }
 
-                const int nstripes = getNumThreads();
+                const int nstripes = computeElementwiseNstripes(src);
                 PBody body(func, src, dst, nstripes);
                 parallel_for_(Range(0, nstripes), body, nstripes);
                 continue;
@@ -398,7 +417,7 @@ public:
             {
                 Mat src_f, dst_f(dst.size, CV_32F);
                 src.convertTo(src_f, CV_32F);
-                const int nstripes = getNumThreads();
+                const int nstripes = computeElementwiseNstripes(src_f);
                 PBody body(func, src_f, dst_f, nstripes);
                 parallel_for_(Range(0, nstripes), body, nstripes);
                 dst_f.convertTo(dst, CV_64F);
@@ -426,10 +445,16 @@ public:
 
     bool unfoldMath(LayerMath& out, const ConstOperand& side) const
     {
-        if (!func.unfoldOp(out, side))
-            return false;
         std::vector<float> params;
-        if (ActivationFunc fn = func.getActivationFunc(CV_32F, params))
+        ActivationFunc fn = func.getActivationFunc(CV_32F, params);
+        if (!func.unfoldOp(out, side)) {
+            // No expression, but a host that can run the kernel can still take it on.
+            if (!fn)
+                return false;
+            out.setKernel(fn, params);
+            return true;
+        }
+        if (fn)
             out.setKernel(fn, params);
         return true;
     }
@@ -484,11 +509,36 @@ struct BaseFunctor
     { return nullptr; }
 
     bool unfoldOp(LayerMath&, const ConstOperand&) const { return false; }
+
+    // CV_32F/CV_64F via the core element-wise engine; false if there is no exact equivalent
+    bool applyCore(const Mat&, Mat&) const { return false; }
 };
+
+// 1-d views: Mat::create() would reallocate a 0-d dst
+static inline bool applyCoreExpr(const std::string& expr, const Mat& src, Mat& dst)
+{
+    CV_Assert(src.isContinuous() && dst.isContinuous() && src.total() == dst.total() &&
+              src.total() <= (size_t)INT_MAX);
+    int n = (int)src.total();
+    std::vector<Mat> res{Mat(1, &n, dst.type(), dst.data)};
+    cv::texpr(expr, std::vector<Mat>{Mat(1, &n, src.type(), src.data)}, res);
+    CV_Assert(res[0].data == dst.data);
+    return true;
+}
+
+static inline std::string exprConst(float v)
+{
+    return cv::format("%.9g", v);
+}
 
 struct ReLUFunctor : public BaseFunctor
 {
     typedef ReLULayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        return slope == 0.f && applyCoreExpr("relu({0})", src, dst);
+    }
     float slope;
 
     explicit ReLUFunctor(float slope_=1.f) : slope(slope_) {}
@@ -502,9 +552,14 @@ struct ReLUFunctor : public BaseFunctor
 
     bool unfoldOp(LayerMath& r, const ConstOperand&) const
     {
-        if (slope != 0.f) return false;
         const int zero = r.constant(0.f);
-        r.binary(FusionEltwiseOp::MAX, LayerMath::INPUT_VALUE, zero);
+        const int pos  = r.binary(FusionEltwiseOp::MAX, LayerMath::INPUT_VALUE, zero);
+        if (slope == 0.f)
+            return true;
+        const int neg    = r.binary(FusionEltwiseOp::MIN, LayerMath::INPUT_VALUE, zero);
+        const int s      = r.constant(slope);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, neg, s);
+        r.binary(FusionEltwiseOp::ADD, pos, scaled);
         return true;
     }
 
@@ -1098,6 +1153,24 @@ struct GeluApproximationFunctor : public BaseDefaultFunctor<GeluApproximationFun
         return cv::dnn::getActivationFunc(ACTIV_GELU_APPROX);
     }
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int x       = LayerMath::INPUT_VALUE;
+        const int coef    = r.constant(GeluApproximationConstants::coef_sqrt_2_pi);
+        const int sq      = r.binary(FusionEltwiseOp::MUL, x, x);
+        const int cubic   = r.binary(FusionEltwiseOp::MUL, coef, sq);
+        const int sqrt2pi = r.constant(GeluApproximationConstants::sqrt_2_pi);
+        const int inner   = r.binary(FusionEltwiseOp::ADD, sqrt2pi, cubic);
+        const int arg     = r.binary(FusionEltwiseOp::MUL, x, inner);
+        const int tanhArg = r.unary(FusionEltwiseOp::TANH, arg);
+        const int one     = r.constant(1.f);
+        const int gate    = r.binary(FusionEltwiseOp::ADD, one, tanhArg);
+        const int half    = r.constant(0.5f);
+        const int halfX   = r.binary(FusionEltwiseOp::MUL, half, x);
+        r.binary(FusionEltwiseOp::MUL, halfX, gate);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV;
@@ -1256,6 +1329,13 @@ struct SwishFunctor : public BaseDefaultFunctor<SwishFunctor>
         if (depth != CV_32F) return nullptr;
         activParams.clear();
         return cv::dnn::getActivationFunc(ACTIV_SWISH);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int gate = fusion::detail::sigmoid(r);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, gate);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -1554,6 +1634,12 @@ struct ELUFunctor : public BaseDefaultFunctor<ELUFunctor>
         return cv::dnn::getActivationFunc(ACTIV_ELU);
     }
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::expLinearUnit(r, alpha, 1.f);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
 #ifdef HAVE_INF_ENGINE
@@ -1643,6 +1729,14 @@ const char* const ELUFunctor::BaseDefaultFunctor<ELUFunctor>::ocl_kernel_name = 
 struct AbsValFunctor : public BaseDefaultFunctor<AbsValFunctor>
 {
     typedef AbsLayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("abs({0})", src, dst); }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::abs(r, LayerMath::INPUT_VALUE);
+        return true;
+    }
 
     bool supportBackend(int backendId, int)
     {
@@ -1985,6 +2079,8 @@ const char* const BaseDefaultFunctor<RoundFunctor>::ocl_kernel_name = "RoundForw
 struct SqrtFunctor : public BaseDefaultFunctor<SqrtFunctor>
 {
     typedef SqrtLayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("sqrt({0})", src, dst); }
 
     bool supportBackend(int backendId, int)
     {
@@ -2458,6 +2554,17 @@ struct HardSwishFunctor : public BaseDefaultFunctor<HardSwishFunctor>
         return cv::dnn::getActivationFunc(ACTIV_HARDSWISH);
     }
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int sixth  = r.constant(1.f / 6.f);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, sixth);
+        const int half   = r.constant(0.5f);
+        const int biased = r.binary(FusionEltwiseOp::ADD, scaled, half);
+        const int gate   = r.clamp(biased, 0.f, 1.f);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, gate);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV ||
@@ -2697,6 +2804,16 @@ struct SoftsignFunctor : public BaseDefaultFunctor<SoftsignFunctor>
 {
     typedef SoftsignLayer Layer;
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int magnitude = fusion::detail::abs(r, LayerMath::INPUT_VALUE);
+        const int one       = r.constant(1.f);
+        const int denom     = r.binary(FusionEltwiseOp::ADD, one, magnitude);
+        const int inv       = r.unary(FusionEltwiseOp::RECIP, denom);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, inv);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2789,6 +2906,15 @@ struct CeluFunctor : public BaseDefaultFunctor<CeluFunctor>
 #endif
     }
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        // A negative alpha flips which side of zero the exponential term lands on.
+        if (!(alpha > 0.f))
+            return false;
+        fusion::detail::expLinearUnit(r, alpha, 1.f / alpha);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2856,6 +2982,16 @@ struct HardSigmoidFunctor : public BaseDefaultFunctor<HardSigmoidFunctor>
         return cv::dnn::getActivationFunc(ACTIV_HARDSIGMOID);
     }
 
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int a      = r.constant(alpha);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, a);
+        const int b      = r.constant(beta);
+        const int biased = r.binary(FusionEltwiseOp::ADD, scaled, b);
+        r.clamp(biased, 0.f, 1.f);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2901,6 +3037,14 @@ struct SeluFunctor : public BaseDefaultFunctor<SeluFunctor>
 #else
         vlanes = 1;
 #endif
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int elu = fusion::detail::expLinearUnit(r, alpha, 1.f);
+        const int g   = r.constant(gamma);
+        r.binary(FusionEltwiseOp::MUL, elu, g);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -2996,6 +3140,18 @@ const char* const BaseDefaultFunctor<ThresholdedReluFunctor>::ocl_kernel_name = 
 struct PowerFunctor : public BaseFunctor
 {
     typedef PowerLayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        std::string x = "{0}";
+        if (scale != 1.f)
+            x = "(" + x + "*(" + exprConst(scale) + "))";
+        if (shift != 0.f)
+            x = "(" + x + "+(" + exprConst(shift) + "))";
+        if (power != 1.f)
+            x = x + "**(" + exprConst(power) + ")";
+        return applyCoreExpr(x, src, dst);
+    }
 
     float power, scale, shift;
     float originPower, originScale, originShift;
@@ -3220,6 +3376,12 @@ struct ExpFunctor : public BaseDefaultFunctor<ExpFunctor>
 {
     typedef ExpLayer Layer;
 
+    // with a base, scale or shift the SIMD kernel of this layer is as fast
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        return normScale == 1.f && normShift == 0.f && applyCoreExpr("exp({0})", src, dst);
+    }
+
     ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
     {
         if (depth != CV_32F)
@@ -3326,6 +3488,19 @@ const char* const ExpFunctor::BaseDefaultFunctor<ExpFunctor>::ocl_kernel_name = 
 struct ChannelsPReLUFunctor : public BaseFunctor
 {
     typedef ChannelsPReLULayer Layer;
+
+    bool unfoldOp(LayerMath& r, const ConstOperand& side) const
+    {
+        if (side.count != 1 || !side.at(0).isBuffer())
+            return false;
+        const int zero   = r.constant(0.f);
+        const int pos    = r.binary(FusionEltwiseOp::MAX, LayerMath::INPUT_VALUE, zero);
+        const int neg    = r.binary(FusionEltwiseOp::MIN, LayerMath::INPUT_VALUE, zero);
+        const int slopes = r.perChannelConstant(side.at(0).bufferId);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, neg, slopes);
+        r.binary(FusionEltwiseOp::ADD, pos, scaled);
+        return true;
+    }
     Mat scale;
 #ifdef HAVE_OPENCL
     UMat scale_umat;
@@ -3476,6 +3651,10 @@ struct ChannelsPReLUFunctor : public BaseFunctor
 
 struct PReLUFunctor : public ChannelsPReLUFunctor
 {
+    //! The slope is per element here, which PER_CHANNEL_CONST cannot express; declining
+    //! keeps the inherited per-channel form from applying.
+    bool unfoldOp(LayerMath&, const ConstOperand&) const { return false; }
+
     explicit PReLUFunctor(const Mat& scale_=Mat()) : ChannelsPReLUFunctor(scale_)
     {
 #ifdef HAVE_OPENCL
@@ -3618,6 +3797,8 @@ const char* const ShrinkFunctor::BaseDefaultFunctor<ShrinkFunctor>::ocl_kernel_n
 struct ReciprocalFunctor : public BaseDefaultFunctor<ReciprocalFunctor>
 {
     typedef ReciprocalLayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("1/{0}", src, dst); }
 
     bool supportBackend(int backendId, int)
     {
@@ -3983,7 +4164,24 @@ Ptr<ExpLayer> ExpLayer::create(const LayerParams& params)
 class ChannelsPReLUImpl CV_FINAL : public ElementWiseLayer<ChannelsPReLUFunctor>
 {
 public:
-    using ElementWiseLayer<ChannelsPReLUFunctor>::ElementWiseLayer;
+    // fusionOpsFor() keys on the dynamic type, which the base constructor cannot register.
+    explicit ChannelsPReLUImpl(const ChannelsPReLUFunctor& f = ChannelsPReLUFunctor())
+        : ElementWiseLayer<ChannelsPReLUFunctor>(f)
+    {
+        registerFusionOpsOnce<ChannelsPReLUImpl>(
+            { &ElementWiseLayer<ChannelsPReLUFunctor>::unfoldOp, nullptr, false, nullptr,
+              &ChannelsPReLUImpl::ownedBuffersOp });
+    }
+
+    //! setSlope() moved the slope into the functor, so it has no Arg for the pass to read.
+    static bool ownedBuffersOp(const Layer* self, std::vector<Mat>& out)
+    {
+        const Mat& s = static_cast<const ChannelsPReLUImpl*>(self)->func.scale;
+        if (s.empty() || s.type() != CV_32F || !s.isContinuous())
+            return false;
+        out.push_back(s);
+        return true;
+    }
 
     void setSlope(const Mat& slope) CV_OVERRIDE
     {

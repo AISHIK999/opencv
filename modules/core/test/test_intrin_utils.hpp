@@ -202,13 +202,9 @@ template<> inline void EXPECT_COMPARE_EQ_<hfloat>(const hfloat a, const hfloat b
 }
 #endif
 
-// pack functions do not do saturation when converting from 64-bit types
+// every width saturates, 64-bit included
 template<typename T, typename W>
 inline T pack_saturate_cast(W a) { return saturate_cast<T>(a); }
-template<>
-inline int pack_saturate_cast<int, int64>(int64 a) { return static_cast<int>(a); }
-template<>
-inline unsigned pack_saturate_cast<unsigned, uint64>(uint64 a) { return static_cast<unsigned>(a); }
 
 template<typename R> struct TheTest
 {
@@ -1506,6 +1502,54 @@ template<typename R> struct TheTest
             EXPECT_COMPARE_EQ(data1[i]*data2[i] + data3[i], resH[i]);
         }
 
+        // Out-of-range, boundary and .5 inputs: the results must saturate to the destination range and
+        // agree with the scalar functions (see the cvRound() documentation for the exact bounds).
+        {
+            typedef typename VTraits<Ri>::lane_type ILaneType;
+            const float inf = std::numeric_limits<float>::infinity();
+            const float ovals32[] = { 3e9f, -3e9f, 1e30f, -1e30f, 2147483520.f, -2147483648.f, inf, -inf,
+                                      2.5f, -2.5f, 2.75f, -2.75f, 0.5f, -0.5f, 100.5f, -100.5f };
+            // 16-bit floats -> 16-bit ints: values that fit into f16, but not into int16
+            const float ovals16[] = { 40000.f, -40000.f, 65504.f, -65504.f, 32768.f, -32768.f, 33000.f, -33000.f,
+                                      2.5f, -2.5f, 2.75f, -2.75f, 0.5f, -0.5f, 100.5f, -100.5f };
+            const int novals = 16;
+            const float* ov = sizeof(ILaneType) == 2 ? ovals16 : ovals32;
+            Data<R> dataO;
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+                dataO[i] = (LaneType)ov[i % novals];
+            R aO = dataO;
+            Data<Ri> roundO = v_round(aO), truncO = v_trunc(aO), floorO = v_floor(aO), ceilO = v_ceil(aO);
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                LaneType x = dataO[i];
+                double xd = (double)x;
+                SCOPED_TRACE(cv::format("overflow: i=%d, x=%g", i, xd));
+                EXPECT_EQ(saturate_cast<ILaneType>(cvRound(x)), roundO[i]);
+                EXPECT_EQ(saturate_cast<ILaneType>(cvTrunc(x)), truncO[i]);
+                EXPECT_EQ(saturate_cast<ILaneType>(cvFloor(x)), floorO[i]);
+                EXPECT_EQ(saturate_cast<ILaneType>(cvCeil(x)), ceilO[i]);
+                if (sizeof(ILaneType) == 4)
+                {
+                    if (xd >= 2147483648.)
+                    {
+                        // INT_MAX is not representable as float, 2147483520 is the largest float below 2^31
+                        int lo = sizeof(LaneType) == 8 ? INT_MAX : 2147483520;
+                        EXPECT_GE((int)roundO[i], lo); EXPECT_LE((int)roundO[i], INT_MAX);
+                        EXPECT_GE((int)truncO[i], lo); EXPECT_LE((int)truncO[i], INT_MAX);
+                        EXPECT_GE((int)floorO[i], lo); EXPECT_LE((int)floorO[i], INT_MAX);
+                        EXPECT_GE((int)ceilO[i], lo);  EXPECT_LE((int)ceilO[i], INT_MAX);
+                    }
+                    else if (xd <= -2147483648.)
+                    {
+                        EXPECT_EQ(INT_MIN, (int)roundO[i]);
+                        EXPECT_EQ(INT_MIN, (int)truncO[i]);
+                        EXPECT_EQ(INT_MIN, (int)floorO[i]);
+                        EXPECT_EQ(INT_MIN, (int)ceilO[i]);
+                    }
+                }
+            }
+        }
+
         return *this;
     }
 #if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
@@ -1530,6 +1574,36 @@ template<typename R> struct TheTest
             EXPECT_EQ(cvRound(data1[i]), resA[i]);
             EXPECT_EQ(cvRound(data1_border[i]), resB[i]);
             EXPECT_EQ(cvRound(data2[i]), resC[i]);
+        }
+
+        // out-of-range inputs must saturate in both halves (see the cvRound() documentation)
+        {
+            const double inf = std::numeric_limits<double>::infinity();
+            const double ovals[] = { 3e9, -3e9, 1e30, -1e30, 2147483647.5, -2147483648.5, inf, -inf,
+                                     2.5, -2.5, 2147483646.5, -2147483647.5, 0.5, -0.5, 1e10, -1e10 };
+            const int novals = 16;
+            Data<R> dataO1, dataO2;
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                dataO1[i] = ovals[i % novals];
+                dataO2[i] = ovals[(i + 5) % novals];
+            }
+            R aO1 = dataO1, aO2 = dataO2;
+            Data<Ri> resO = v_round(aO1, aO2);
+            for (int i = 0; i < VTraits<R>::vlanes(); ++i)
+            {
+                SCOPED_TRACE(cv::format("overflow: i=%d", i));
+                EXPECT_EQ(cvRound(dataO1[i]), resO[i]);
+                EXPECT_EQ(cvRound(dataO2[i]), resO[i + VTraits<R>::vlanes()]);
+                if (dataO1[i] >= 2147483648.)
+                {
+                    EXPECT_EQ(INT_MAX, resO[i]);
+                }
+                if (dataO1[i] <= -2147483648.)
+                {
+                    EXPECT_EQ(INT_MIN, resO[i]);
+                }
+            }
         }
 
         return *this;
@@ -1599,6 +1673,65 @@ template<typename R> struct TheTest
             EXPECT_EQ((double)dataB[i], resD[i]);
         }
 #endif
+        return *this;
+    }
+
+    // 64->32 now saturates like every other width, so check the three narrows at the boundaries
+    // that tell saturation and truncation apart. Truncation returns the low 32 bits, which for
+    // these inputs is a different value - and usually the wrong end of the range.
+    TheTest & test_pack64_saturation()
+    {
+        typedef typename V_RegTraits<R>::w_reg W;              // 64-bit, same signedness as R
+        typedef typename VTraits<W>::lane_type w_type;
+        const int n = VTraits<W>::vlanes();
+
+        Data<W> dataA, dataB;
+        for (int i = 0; i < n; ++i)
+        {
+            dataA[i] = (w_type)((int64)INT_MAX + 1 + i);       // just above the int32 range
+            dataB[i] = (w_type)((int64)1 << 40);               // far above both 32-bit ranges
+        }
+        W a = dataA, b = dataB;
+
+        Data<R> res = v_pack(a, b);
+        for (int i = 0; i < n; ++i)
+        {
+            SCOPED_TRACE(cv::format("i=%d", i));
+            EXPECT_EQ(saturate_cast<LaneType>(dataA[i]), res[i]);
+            EXPECT_EQ(saturate_cast<LaneType>(dataB[i]), res[i + n]);
+        }
+
+        Data<R> stored(0);
+        v_pack_store(stored.d, b);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(saturate_cast<LaneType>(dataB[i]), stored[i]);
+        return *this;
+    }
+
+    // v_pack_u: int64 -> uint32, so negatives clamp to 0 and anything above UINT_MAX to UINT_MAX
+    TheTest & test_pack64_u_saturation()
+    {
+        const int n = VTraits<v_int64>::vlanes();
+        Data<v_int64> dataA, dataB;
+        for (int i = 0; i < n; ++i)
+        {
+            dataA[i] = -((int64)1 << 40) - i;                  // below zero by a long way
+            dataB[i] = ((int64)1 << 40) + i;                   // above UINT_MAX
+        }
+        v_int64 a = dataA, b = dataB;
+
+        Data<v_uint32> res = v_pack_u(a, b);
+        for (int i = 0; i < n; ++i)
+        {
+            SCOPED_TRACE(cv::format("i=%d", i));
+            EXPECT_EQ(saturate_cast<unsigned>(dataA[i]), res[i]);
+            EXPECT_EQ(saturate_cast<unsigned>(dataB[i]), res[i + n]);
+        }
+
+        Data<v_uint32> stored(0);
+        v_pack_u_store(stored.d, a);
+        for (int i = 0; i < n; ++i)
+            EXPECT_EQ(saturate_cast<unsigned>(dataA[i]), stored[i]);
         return *this;
     }
 
@@ -2430,6 +2563,8 @@ void test_hal_intrin_uint32()
         .test_mask()
         .test_popcount()
         .test_pack<1>().test_pack<2>().test_pack<15>().test_pack<32>()
+        .test_pack64_saturation()
+        .test_pack64_u_saturation()
         .test_unpack()
         .test_reverse()
         .test_extract<0>().test_extract<1>().test_extract<2>().test_extract<3>()
@@ -2466,6 +2601,7 @@ void test_hal_intrin_int32()
         .test_reduce_sad()
         .test_mask()
         .test_pack<1>().test_pack<2>().test_pack<15>().test_pack<32>()
+        .test_pack64_saturation()
         .test_unpack()
         .test_reverse()
         .test_extract<0>().test_extract<1>().test_extract<2>().test_extract<3>()

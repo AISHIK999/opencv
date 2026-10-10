@@ -1171,7 +1171,7 @@ OPENCV_HAL_IMPL_LASX_ROTATE_CAST(v_rotate_right, v_float64x4, _lasx_256_castsi25
 /** Reverse **/
 inline v_uint8x32 v_reverse(const v_uint8x32 &a)
 {
-    static const __m256i perm = _v256_setr_b(
+    const __m256i perm = _v256_setr_b(
             15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
             15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
     __m256i vec = __lasx_xvshuf_b(a.val, a.val, perm);
@@ -2251,23 +2251,17 @@ void v_rshr_pack_store(short* ptr, const v_int32x8& a)
 
 // 64
 // Non-saturating pack
-inline v_uint32x8 v_pack(const v_uint64x4& a, const v_uint64x4& b)
+// truncating narrows, kept private: v_pack()/v_pack_u() below saturate like every other width
+inline v_uint32x8 v_pack_trunc(const v_uint64x4& a, const v_uint64x4& b)
 {
     __m256i ab = __lasx_xvpickev_w(b.val, a.val);
     return v_uint32x8(_v256_shuffle_odd_64(ab));
 }
 
-inline v_int32x8 v_pack(const v_int64x4& a, const v_int64x4& b)
-{ return v_reinterpret_as_s32(v_pack(v_reinterpret_as_u64(a), v_reinterpret_as_u64(b))); }
+inline v_int32x8 v_pack_trunc(const v_int64x4& a, const v_int64x4& b)
+{ return v_reinterpret_as_s32(v_pack_trunc(v_reinterpret_as_u64(a), v_reinterpret_as_u64(b))); }
 
-inline void v_pack_store(unsigned* ptr, const v_uint64x4& a)
-{
-    __m256i a0 = __lasx_xvshuf4i_w(a.val, 0x08);
-    v_store_low(ptr, v_uint32x8(_v256_shuffle_odd_64(a0)));
-}
-
-inline void v_pack_store(int* ptr, const v_int64x4& b)
-{ v_pack_store((unsigned*)ptr, v_reinterpret_as_u64(b)); }
+OPENCV_HAL_IMPL_SATURATING_PACK_64(v_int64x4, v_uint64x4, v_int32x8, v_uint32x8, v256_setall_s32, v_pack_trunc, v_pack_trunc)
 
 template<int n> inline
 v_uint32x8 v_rshr_pack(const v_uint64x4& a, const v_uint64x4& b)
@@ -2414,7 +2408,7 @@ inline double v_extract_n(v_float64x4 v)
 template<int i>
 inline v_uint32x8 v_broadcast_element(v_uint32x8 a)
 {
-    static const __m256i perm = __lasx_xvreplgr2vr_w((char)i);
+    const __m256i perm = __lasx_xvreplgr2vr_w((char)i);
     return v_uint32x8(__lasx_xvperm_w(a.val, perm));
 }
 
